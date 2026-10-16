@@ -9,6 +9,9 @@ import argparse
 import time
 import os
 import subprocess
+import fcntl
+import signal
+import tempfile
 import pandas as pd
 
 
@@ -56,16 +59,86 @@ retriever = db.as_retriever(search_kwargs={"k": target_source_chunks})
 uploaded_files = [os.path.join("source_documents", filename) for filename in os.listdir("source_documents") if filename != ".DS_Store"]
 uploaded_file = st.sidebar.file_uploader("Choose a file", type=["csv","docx","doc","enex","eml","epub","html","md","msg","odt","pdf","pptx ","ppt ","txt"])
 
+SOURCE_DIR = "source_documents"
+# Admission limits protecting the shared corpus and ingestion resources.
+MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', 10 * 1024 * 1024))
+MAX_CORPUS_BYTES = int(os.environ.get('MAX_CORPUS_BYTES', 200 * 1024 * 1024))
+MAX_CORPUS_FILES = int(os.environ.get('MAX_CORPUS_FILES', 200))
+INGEST_TIMEOUT_SECONDS = int(os.environ.get('INGEST_TIMEOUT_SECONDS', 600))
+INGEST_COOLDOWN_SECONDS = int(os.environ.get('INGEST_COOLDOWN_SECONDS', 30))
+INGEST_LOCK_PATH = os.path.join(tempfile.gettempdir(), "hackgptp_ingest.lock")
+
+
+def corpus_usage(exclude_path=None):
+    """Return (file_count, total_bytes) for the shared source directory."""
+    count, total = 0, 0
+    for name in os.listdir(SOURCE_DIR):
+        path = os.path.join(SOURCE_DIR, name)
+        if name == ".DS_Store" or not os.path.isfile(path):
+            continue
+        if exclude_path is not None and os.path.abspath(path) == os.path.abspath(exclude_path):
+            continue
+        count += 1
+        total += os.path.getsize(path)
+    return count, total
+
+
+def run_ingest(file_path):
+    """Run ingest.py under a process-wide lock, a cooldown and a hard deadline.
+
+    Returns (ok, message).
+    """
+    now = time.time()
+    last = st.session_state.get("last_ingest_time", 0)
+    if now - last < INGEST_COOLDOWN_SECONDS:
+        return False, "Ingestion rate limit reached. Please wait before submitting another ingestion request."
+
+    lock_file = open(INGEST_LOCK_PATH, "a")
+    try:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False, "Another ingestion is already in progress. Please try again later."
+
+        st.session_state["last_ingest_time"] = now
+        proc = subprocess.Popen(["python3", "ingest.py", file_path], start_new_session=True)
+        try:
+            proc.communicate(timeout=INGEST_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
+            return False, "Ingestion exceeded the permitted processing time and was terminated."
+        return True, ""
+    finally:
+        lock_file.close()  # releases the flock
+
+
 def save_uploaded_file(uploaded_file):
-    file_name = uploaded_file.name
-    file_path = os.path.join("source_documents", file_name)
+    # Strip any directory components from the client-supplied name.
+    file_name = os.path.basename(uploaded_file.name.replace("\\", "/"))
+    if not file_name or file_name in (".", ".."):
+        return None, "Invalid file name."
+    file_path = os.path.join(SOURCE_DIR, file_name)
+
+    size = uploaded_file.size
+    if size > MAX_UPLOAD_BYTES:
+        return None, f"File exceeds the maximum upload size of {MAX_UPLOAD_BYTES} bytes."
+    count, total = corpus_usage(exclude_path=file_path)
+    if count + 1 > MAX_CORPUS_FILES or total + size > MAX_CORPUS_BYTES:
+        return None, "The shared document corpus has reached its size limit. Delete files before uploading more."
+
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Call ingest.py script
-    subprocess.run(["python3", "ingest.py", file_path])
+    # Call ingest.py script (guarded by lock, cooldown and timeout)
+    ok, message = run_ingest(file_path)
+    if not ok:
+        return file_path, message
 
-    return file_path
+    return file_path, ""
 
 
 
@@ -79,9 +152,18 @@ def split_text_into_chunks(text, chunk_size):
     return chunks
  
 if uploaded_file is not None:
-    file_path = save_uploaded_file(uploaded_file)
-    st.sidebar.success("File uploaded successfully.")
-    uploaded_files.append(file_path)
+    # Streamlit reruns the script on every interaction; only process each upload once.
+    upload_key = (uploaded_file.name, uploaded_file.size)
+    if st.session_state.get("processed_upload") != upload_key:
+        file_path, error_message = save_uploaded_file(uploaded_file)
+        st.session_state["processed_upload"] = upload_key
+        if file_path is None:
+            st.sidebar.error(error_message)
+        elif error_message:
+            st.sidebar.warning("File saved but not ingested: " + error_message)
+        else:
+            st.sidebar.success("File uploaded successfully.")
+            uploaded_files.append(file_path)
 uploaded_files = [os.path.join("source_documents", filename) for filename in os.listdir("source_documents") if filename != ".DS_Store"]
 
 df_data = []
@@ -130,9 +212,14 @@ if delete_training_data:
 
 if reprocess_training_data:
     # Reprocess selected files logic here
-    for file_path in selected_files:
-        subprocess.run(["python3", "ingest.py", file_path])
-    st.sidebar.success("Selected files re-processed.")
+    # ingest.py processes the whole source directory regardless of the argument,
+    # so a single guarded run is sufficient for any number of selected files.
+    if selected_files:
+        ok, message = run_ingest(selected_files[0])
+        if ok:
+            st.sidebar.success("Selected files re-processed.")
+        else:
+            st.sidebar.error(message)
     st.stop()
 
 if show_training_data:
